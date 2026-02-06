@@ -1,0 +1,882 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+REVIEW-READY (single file): MAIN + A/B/C + D + E + Stuart–Landau (shear/noise)
+- No input CSV required (simulates everything)
+- Exports ALL Results-ready numbers as CSV
+- Exports ALL figures as PNG (legend never overlaps traces)
+
+Outputs are written to ./outputs/
+
+Run:
+  python run_all_analyses_review_ready.py
+
+Notes:
+- delta_tau is swept in SECONDS (absolute time control).
+- ratio = delta_tau / T0, where T0 is empirically measured from the common mode (Welch peak).
+  If T0 is NaN (e.g., no clear spectral peak), ratio falls back to a model-based period where available.
+- This script does NOT rely on __file__ (works in notebooks too).
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.signal import welch, hilbert
+from numpy.linalg import inv
+
+
+# ============================================================
+# CONFIG (edit here only)
+# ============================================================
+
+OUTDIR = "outputs"
+
+# Global discretization
+DT = 0.001
+
+# Delay asymmetry sweep (seconds)
+TAU_AVG = 0.20
+DELTA_TAU_MAX = 0.30
+N_POINTS = 21  # increase for smoother curves
+
+# Main tanh model parameters
+KAPPA_MAIN = 4.0
+NOISE_SIGMA_MAIN = 0.03
+
+T_MAIN = 30.0
+BURN_MAIN = 5.0
+
+T_SWEEP = 40.0
+BURN_SWEEP = 5.0
+REPS_SWEEP = 6  # increase for publication-grade smoothness
+
+# Kuramoto baseline
+K_KUR = 1.5
+F_LIST = (4.0, 8.0)
+T_KUR = 25.0
+BURN_KUR = 5.0
+REPS_KUR = 8
+
+# Kappa robustness
+KAPPA_LIST = (1.0, 2.0, 4.0)
+
+# Stuart–Landau parameters (canonical normal form)
+# z' = (lam + i*omega) z - (1 + i*c) |z|^2 z + coupling + noise
+SL_LAM = 1.0
+SL_OMEGA = 2.0 * np.pi * 6.0  # 6 Hz baseline frequency
+SL_K = 1.0                   # linear diffusive coupling strength
+SL_DT = DT
+SL_T = 40.0
+SL_BURN = 8.0
+SL_REPS = 6
+
+# Shear sweep (c): include negative, zero, positive
+SL_SHEAR_LIST = (-2.0, -1.0, 0.0, 1.0, 2.0)
+
+# Noise sweep for SL (sigma)
+SL_NOISE_LIST = (0.00, 0.01, 0.02, 0.03, 0.05)
+
+# Seeds
+SEED_MAIN = 100
+SEED0_SWEEP = 1000
+SEED0_KUR = 9000
+SEED0_SL = 20000
+
+
+# ============================================================
+# Utilities
+# ============================================================
+
+def ensure_outdir():
+    os.makedirs(OUTDIR, exist_ok=True)
+
+def ou_input(n, dt, tau=0.05, sigma=0.03, seed=0):
+    """Ornstein–Uhlenbeck process (exact discrete update)."""
+    rng = np.random.default_rng(seed)
+    x = np.zeros(n, dtype=float)
+    a = np.exp(-dt / tau)
+    s = sigma * np.sqrt(max(1e-15, 1.0 - a * a))
+    z = rng.normal(size=n)
+    for i in range(1, n):
+        x[i] = a * x[i - 1] + s * z[i]
+    return x
+
+def wrap_pi(a):
+    return (a + np.pi) % (2.0 * np.pi) - np.pi
+
+def welch_peak_period_safe(x, fs, fmin=0.8, fmax=15.0):
+    """
+    Estimate an emergent period via Welch PSD peak.
+    Returns NaN if no reliable peak exists.
+    """
+    x = np.asarray(x, dtype=float)
+    x = x - np.mean(x)
+    if len(x) < 1024:
+        return float("nan")
+    nperseg = min(len(x), 4096)
+    f, P = welch(x, fs=fs, nperseg=nperseg)
+    band = (f >= fmin) & (f <= fmax)
+    if not np.any(band):
+        return float("nan")
+    fb = f[band]
+    Pb = P[band]
+    if np.all(~np.isfinite(Pb)) or (np.nanmax(Pb) <= 0):
+        return float("nan")
+    f_peak = fb[np.nanargmax(Pb)]
+    if not np.isfinite(f_peak) or f_peak <= 0:
+        return float("nan")
+    return float(1.0 / f_peak)
+
+def circular_variance(phi):
+    phi = np.asarray(phi, dtype=float)
+    return float(1.0 - np.abs(np.mean(np.exp(1j * phi))))
+
+def normalized_mutual_information(x, y, bins=24):
+    """Normalized MI using histogram estimator: I(x;y)/H(x,y)."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    xr = np.quantile(x, [0.01, 0.99])
+    yr = np.quantile(y, [0.01, 0.99])
+    x = np.clip(x, xr[0], xr[1])
+    y = np.clip(y, yr[0], yr[1])
+
+    Hxy, _, _ = np.histogram2d(x, y, bins=bins, density=True)
+    pxy = (Hxy + 1e-12)
+    pxy /= pxy.sum()
+
+    px = pxy.sum(axis=1)
+    py = pxy.sum(axis=0)
+
+    Hx = -np.sum(px * np.log(px))
+    Hy = -np.sum(py * np.log(py))
+    Hxy_ent = -np.sum(pxy * np.log(pxy))
+    Ixy = Hx + Hy - Hxy_ent
+
+    if Hxy_ent <= 1e-12:
+        return 0.0
+    return float(Ixy / Hxy_ent)
+
+def fisher_gaussian(mu, Sigma, dmu, dSig):
+    """Fisher information for multivariate Gaussian."""
+    mu = np.asarray(mu, dtype=float).reshape(-1, 1)
+    dmu = np.asarray(dmu, dtype=float).reshape(-1, 1)
+    Sigma = np.asarray(Sigma, dtype=float)
+    dSig = np.asarray(dSig, dtype=float)
+
+    reg = 1e-8 * np.eye(Sigma.shape[0])
+    S = Sigma + reg
+    Sinv = inv(S)
+
+    term1 = float(dmu.T @ Sinv @ dmu)
+    term2 = 0.5 * float(np.trace(Sinv @ dSig @ Sinv @ dSig))
+    return term1 + term2
+
+def fisher_gaussian_scalar(mu, var, dmu, dvar):
+    """Fisher information for scalar Gaussian."""
+    var = float(var) + 1e-12
+    return (float(dmu) ** 2) / var + 0.5 * (float(dvar) ** 2) / (var ** 2)
+
+def legend_outside(ax, ncol=1):
+    """Place legend outside without overlapping traces."""
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, frameon=False, ncol=ncol)
+
+def savefig(fig, path):
+    fig.savefig(path, dpi=240, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ============================================================
+# Core simulator: 2-unit nonlinear delayed tanh system
+# ============================================================
+
+def simulate_tanh_delayed(tau1, tau2, dt, T, burn, kappa, noise_sigma, seed):
+    """
+    x1_dot = -x1 + tanh(kappa * x2(t - tau2)) + eta1(t)
+    x2_dot = -x2 + tanh(kappa * x1(t - tau1)) + eta2(t)
+    Euler-Maruyama + OU noise.
+    """
+    tau1 = float(max(0.0, tau1))
+    tau2 = float(max(0.0, tau2))
+
+    n_steps = int(np.round(T / dt))
+    burn_steps = int(np.round(burn / dt))
+
+    d1 = int(np.round(tau1 / dt))
+    d2 = int(np.round(tau2 / dt))
+    D = max(d1, d2, 1)
+
+    total = D + n_steps
+    x = np.zeros((2, total), dtype=float)
+
+    eta1 = ou_input(total, dt, tau=0.05, sigma=noise_sigma, seed=seed + 11)
+    eta2 = ou_input(total, dt, tau=0.05, sigma=noise_sigma, seed=seed + 23)
+    sdt = np.sqrt(dt)
+
+    for i in range(D, total):
+        x1 = x[0, i - 1]
+        x2 = x[1, i - 1]
+        x2_del = x[1, i - d2]
+        x1_del = x[0, i - d1]
+        x[0, i] = x1 + dt * (-x1 + np.tanh(kappa * x2_del)) + eta1[i] * sdt
+        x[1, i] = x2 + dt * (-x2 + np.tanh(kappa * x1_del)) + eta2[i] * sdt
+
+    start = D + burn_steps
+    if start >= total - 10:
+        raise RuntimeError("Not enough post-burn samples. Increase T or reduce burn.")
+    return x[:, start:], dt
+
+
+def metrics_tanh(data, dt):
+    x1, x2 = data
+    s = 0.5 * (x1 + x2)
+    d = 0.5 * (x1 - x2)
+
+    fs = 1.0 / dt
+    T0 = welch_peak_period_safe(s, fs=fs, fmin=0.8, fmax=15.0)
+
+    I_INT = normalized_mutual_information(x1, x2, bins=24)
+
+    h1 = hilbert(x1 - np.mean(x1))
+    h2 = hilbert(x2 - np.mean(x2))
+    phi = wrap_pi(np.angle(h1) - np.angle(h2))
+    mean_phase = float(np.mean(phi))
+    Q = circular_variance(phi)
+    C = float(I_INT * Q)
+
+    mu = np.array([np.mean(x1), np.mean(x2)], dtype=float)
+    Sigma = np.cov(np.vstack([x1, x2]))
+
+    out = {
+        "T0": float(T0),
+        "I_INT": float(I_INT),
+        "Q": float(Q),
+        "C": float(C),
+        "mean_phase": float(mean_phase),
+        "mean_abs_d": float(np.mean(np.abs(d))),
+        "mu1": float(mu[0]),
+        "mu2": float(mu[1]),
+        "S11": float(Sigma[0, 0]),
+        "S12": float(Sigma[0, 1]),
+        "S22": float(Sigma[1, 1]),
+        "mu_s": float(np.mean(s)),
+        "var_s": float(np.var(s)),
+        "mu_d": float(np.mean(d)),
+        "var_d": float(np.var(d)),
+    }
+    return out
+
+
+# ============================================================
+# MAIN (time series + Figure 1 + summary CSV)
+# ============================================================
+
+def run_main():
+    data, dt = simulate_tanh_delayed(
+        tau1=TAU_AVG, tau2=TAU_AVG,
+        dt=DT, T=T_MAIN, burn=BURN_MAIN,
+        kappa=KAPPA_MAIN, noise_sigma=NOISE_SIGMA_MAIN,
+        seed=SEED_MAIN
+    )
+
+    x1, x2 = data
+    s = 0.5 * (x1 + x2)
+    d = 0.5 * (x1 - x2)
+    t = np.arange(len(x1)) * dt
+
+    h1 = hilbert(x1 - np.mean(x1))
+    h2 = hilbert(x2 - np.mean(x2))
+    phi = wrap_pi(np.angle(h1) - np.angle(h2))
+
+    fs = 1.0 / dt
+    T0 = welch_peak_period_safe(s, fs=fs, fmin=0.8, fmax=15.0)
+
+    # Export timeseries CSV (Results figure data)
+    df_ts = pd.DataFrame({"t": t, "x1": x1, "x2": x2, "s": s, "d": d, "phi": phi})
+    df_ts.to_csv(os.path.join(OUTDIR, "main_analysis_timeseries.csv"), index=False)
+
+    # Export summary CSV
+    m = metrics_tanh(data, dt)
+    df_sum = pd.DataFrame([{
+        "tau1": TAU_AVG, "tau2": TAU_AVG, "dt": DT,
+        "T": T_MAIN, "burn": BURN_MAIN,
+        "kappa": KAPPA_MAIN, "noise_sigma": NOISE_SIGMA_MAIN,
+        **m
+    }])
+    df_sum.to_csv(os.path.join(OUTDIR, "main_analysis_summary.csv"), index=False)
+
+    # Figure 1 (A/B/C)
+    fig = plt.figure(figsize=(11, 8.5))
+
+    # Panel A: time series x1/x2
+    ax1 = fig.add_subplot(3, 1, 1)
+    ax1.plot(t, x1, label="x1")
+    ax1.plot(t, x2, label="x2")
+    ax1.set_xlabel("Time (s)")
+    ax1.set_ylabel("State")
+    ax1.set_title("Figure 1A. Symmetric delay: time series")
+    legend_outside(ax1)
+
+    # Panel B: modes
+    ax2 = fig.add_subplot(3, 1, 2)
+    ax2.plot(t, s, label="common mode s=(x1+x2)/2")
+    ax2.plot(t, d, label="difference mode d=(x1-x2)/2")
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylabel("Mode amplitude")
+    ax2.set_title("Figure 1B. Mode decomposition")
+    legend_outside(ax2)
+
+    # Panel C: PSD of s
+    ax3 = fig.add_subplot(3, 1, 3)
+    f, P = welch(s - np.mean(s), fs=fs, nperseg=min(len(s), 4096))
+    ax3.plot(f, P, label="Welch PSD of s(t)")
+    ax3.set_xlim(0.0, 20.0)
+    ax3.set_xlabel("Frequency (Hz)")
+    ax3.set_ylabel("Power")
+    ax3.set_title("Figure 1C. Broad spectral peak (emergent timescale)")
+    legend_outside(ax3)
+
+    savefig(fig, os.path.join(OUTDIR, "Figure1.png"))
+    return T0
+
+
+# ============================================================
+# A/B/C: sweep delta_tau, compute FI + coordination, export CSV + Figure 2
+# ============================================================
+
+def run_ABC(kappa):
+    delta_taus = np.linspace(0.0, DELTA_TAU_MAX, N_POINTS)
+    rows = []
+
+    for i, dtau in enumerate(delta_taus):
+        tau1 = TAU_AVG + 0.5 * dtau
+        tau2 = max(0.0, TAU_AVG - 0.5 * dtau)
+
+        per_rep = []
+        for r in range(REPS_SWEEP):
+            seed = SEED0_SWEEP + i * 100 + r * 7 + int(1000 * kappa)
+            data, dt = simulate_tanh_delayed(
+                tau1=tau1, tau2=tau2,
+                dt=DT, T=T_SWEEP, burn=BURN_SWEEP,
+                kappa=kappa, noise_sigma=NOISE_SIGMA_MAIN,
+                seed=seed
+            )
+            m = metrics_tanh(data, dt)
+            m.update({"delta_tau": float(dtau), "tau1": float(tau1), "tau2": float(tau2)})
+            per_rep.append(m)
+
+        df_rep = pd.DataFrame(per_rep)
+        mean = df_rep.mean(numeric_only=True)
+        std = df_rep.std(numeric_only=True, ddof=1)
+
+        row = {k: float(mean[k]) for k in mean.index}
+        for k in std.index:
+            row[f"{k}_std"] = float(std[k]) if np.isfinite(std[k]) else float("nan")
+
+        # ratio uses measured mean T0; if NaN, keep NaN and downstream uses delta_tau directly if needed
+        row["ratio"] = float(row["delta_tau"] / (row["T0"] + 1e-12)) if np.isfinite(row["T0"]) else float("nan")
+        rows.append(row)
+
+    df = pd.DataFrame(rows).sort_values("delta_tau").reset_index(drop=True)
+
+    # geometry proxy + phase sensitivity
+    df["theory_sin"] = np.abs(np.sin(np.pi * df["ratio"])) if df["ratio"].notna().any() else np.nan
+    df["d_mean_phase_d_ratio"] = np.gradient(df["mean_phase"].values, df["ratio"].values)
+
+    # Fisher full (2D Gaussian): d/d(delta_tau)
+    mus = df[["mu1", "mu2"]].values
+    Sigmas = np.array([
+        [[df.loc[i, "S11"], df.loc[i, "S12"]],
+         [df.loc[i, "S12"], df.loc[i, "S22"]]]
+        for i in range(len(df))
+    ], dtype=float)
+
+    dmus = np.gradient(mus, df["delta_tau"].values, axis=0)
+    dSig = np.gradient(Sigmas, df["delta_tau"].values, axis=0)
+    df["F_full"] = [fisher_gaussian(mus[i], Sigmas[i], dmus[i], dSig[i]) for i in range(len(df))]
+
+    # Fisher for scalar modes (s,d)
+    mu_s, var_s = df["mu_s"].values, df["var_s"].values
+    mu_d, var_d = df["mu_d"].values, df["var_d"].values
+
+    dmu_s = np.gradient(mu_s, df["delta_tau"].values)
+    dvar_s = np.gradient(var_s, df["delta_tau"].values)
+    dmu_d = np.gradient(mu_d, df["delta_tau"].values)
+    dvar_d = np.gradient(var_d, df["delta_tau"].values)
+
+    df["F_s"] = [fisher_gaussian_scalar(mu_s[i], var_s[i], dmu_s[i], dvar_s[i]) for i in range(len(df))]
+    df["F_d"] = [fisher_gaussian_scalar(mu_d[i], var_d[i], dmu_d[i], dvar_d[i]) for i in range(len(df))]
+
+    return df
+
+
+def figure2_separation(df):
+    # Figure 2A: F_d and C vs ratio
+    # Figure 2B: F_s and F_d vs ratio
+    fig = plt.figure(figsize=(11, 6.5))
+
+    ax1 = fig.add_subplot(1, 2, 1)
+    ax1.plot(df["ratio"], df["F_d"], label="F_d (differential-mode Fisher)")
+    ax1.plot(df["ratio"], df["C"], label="C = I_INT × Q (coordination index)")
+    ax1.set_xlabel("Δτ / T0 (measured)")
+    ax1.set_ylabel("Value")
+    ax1.set_title("Figure 2A. Separation: sensitivity vs coordination")
+    legend_outside(ax1)
+
+    ax2 = fig.add_subplot(1, 2, 2)
+    ax2.plot(df["ratio"], df["F_s"], label="F_s (common-mode Fisher)")
+    ax2.plot(df["ratio"], df["F_d"], label="F_d (differential-mode Fisher)")
+    ax2.set_xlabel("Δτ / T0 (measured)")
+    ax2.set_ylabel("Value")
+    ax2.set_title("Figure 2B. Mode-wise redistribution of Fisher information")
+    legend_outside(ax2)
+
+    savefig(fig, os.path.join(OUTDIR, "Figure2.png"))
+
+
+# ============================================================
+# D: delayed Kuramoto baseline (Figure 3A)
+# ============================================================
+
+def simulate_kuramoto(delta_tau, f0, K, tau_avg, dt, T, burn, seed):
+    rng = np.random.default_rng(seed)
+    omega = 2.0 * np.pi * float(f0)
+
+    tau1 = tau_avg + 0.5 * delta_tau
+    tau2 = max(0.0, tau_avg - 0.5 * delta_tau)
+
+    n_steps = int(np.round(T / dt))
+    burn_steps = int(np.round(burn / dt))
+
+    d1 = int(np.round(tau1 / dt))
+    d2 = int(np.round(tau2 / dt))
+    D = max(d1, d2, 1)
+
+    total = D + n_steps
+    th1 = np.zeros(total, dtype=float)
+    th2 = np.zeros(total, dtype=float)
+
+    th1[:D] = 2.0 * np.pi * rng.random()
+    th2[:D] = 2.0 * np.pi * rng.random()
+
+    for i in range(D, total):
+        th1_prev = th1[i - 1]
+        th2_prev = th2[i - 1]
+        th2_del = th2[i - d2]
+        th1_del = th1[i - d1]
+        th1[i] = th1_prev + dt * (omega + K * np.sin(th2_del - th1_prev))
+        th2[i] = th2_prev + dt * (omega + K * np.sin(th1_del - th2_prev))
+
+    start = D + burn_steps
+    th1 = th1[start:]
+    th2 = th2[start:]
+    dphi = wrap_pi(th1 - th2)
+
+    Q = circular_variance(dphi)
+    mean_phase = float(np.mean(dphi))
+    T0_fixed = 1.0 / float(f0)
+    return Q, mean_phase, T0_fixed
+
+
+def run_kuramoto(delta_taus):
+    rows = []
+    for f0 in F_LIST:
+        for i, dtau in enumerate(delta_taus):
+            Qs, MPs = [], []
+            for r in range(REPS_KUR):
+                seed = SEED0_KUR + int(100 * f0) + i * 100 + r * 11
+                Q, mp, T0_fixed = simulate_kuramoto(
+                    delta_tau=float(dtau), f0=float(f0),
+                    K=K_KUR, tau_avg=TAU_AVG,
+                    dt=DT, T=T_KUR, burn=BURN_KUR,
+                    seed=seed
+                )
+                Qs.append(Q)
+                MPs.append(mp)
+
+            rows.append({
+                "f0": float(f0),
+                "delta_tau": float(dtau),
+                "T0_fixed": float(T0_fixed),
+                "ratio": float(dtau) / float(T0_fixed),
+                "Q_kuramoto": float(np.mean(Qs)),
+                "Q_kuramoto_std": float(np.std(Qs, ddof=1)) if len(Qs) > 1 else 0.0,
+                "mean_phase_kuramoto": float(np.mean(MPs)),
+                "mean_phase_kuramoto_std": float(np.std(MPs, ddof=1)) if len(MPs) > 1 else 0.0,
+            })
+
+    dfk = pd.DataFrame(rows).sort_values(["f0", "delta_tau"]).reset_index(drop=True)
+
+    # phase sensitivity per f0 group
+    sens = np.zeros(len(dfk), dtype=float)
+    for f0 in dfk["f0"].unique():
+        idx = dfk["f0"] == f0
+        g = dfk.loc[idx].copy()
+        sens[idx] = np.gradient(g["mean_phase_kuramoto"].values, g["ratio"].values)
+    dfk["d_mean_phase_d_ratio"] = sens
+    return dfk
+
+
+# ============================================================
+# E: kappa robustness (Figure 3B)
+# ============================================================
+
+def run_kappa_robustness():
+    rows = []
+    for kappa in KAPPA_LIST:
+        df = run_ABC(kappa=kappa)
+        idx_Fd = int(np.nanargmax(df["F_d"].values))
+        idx_C  = int(np.nanargmax(df["C"].values))
+        rows.append({
+            "kappa": float(kappa),
+            "ratio_peak_F_d": float(df.loc[idx_Fd, "ratio"]),
+            "ratio_peak_C": float(df.loc[idx_C, "ratio"]),
+            "delta_tau_peak_F_d": float(df.loc[idx_Fd, "delta_tau"]),
+            "delta_tau_peak_C": float(df.loc[idx_C, "delta_tau"]),
+        })
+    return pd.DataFrame(rows).sort_values("kappa").reset_index(drop=True)
+
+
+def figure3_kuramoto_kappa(dfk, dfe):
+    fig = plt.figure(figsize=(11, 6.5))
+
+    # Panel A: Kuramoto sensitivity
+    ax1 = fig.add_subplot(1, 2, 1)
+    for f0 in sorted(dfk["f0"].unique()):
+        sub = dfk[dfk["f0"] == f0]
+        ax1.plot(sub["ratio"], sub["d_mean_phase_d_ratio"], label=f"Kuramoto (f0={f0} Hz)")
+    ax1.set_xlabel("Δτ / T0_fixed")
+    ax1.set_ylabel("d⟨Δφ⟩/d(Δτ/T0)")
+    ax1.set_title("Figure 3A. Phase-only baseline (Kuramoto)")
+    legend_outside(ax1)
+
+    # Panel B: peak separation across kappa
+    ax2 = fig.add_subplot(1, 2, 2)
+    ax2.plot(dfe["kappa"], dfe["ratio_peak_F_d"], marker="o", label="peak of F_d (ratio)")
+    ax2.plot(dfe["kappa"], dfe["ratio_peak_C"], marker="s", label="peak of C (ratio)")
+    ax2.set_xlabel("κ (nonlinearity strength)")
+    ax2.set_ylabel("Peak location in Δτ/T0")
+    ax2.set_title("Figure 3B. Robust ordering across κ")
+    legend_outside(ax2)
+
+    savefig(fig, os.path.join(OUTDIR, "Figure3.png"))
+
+
+# ============================================================
+# Stuart–Landau (shear/noise; Figure 4)
+# ============================================================
+
+def simulate_stuart_landau_pair(tau1, tau2, dt, T, burn, lam, omega, c_shear, K, noise_sigma, seed):
+    """
+    Complex Stuart–Landau with linear diffusive coupling and delay in coupling term:
+      z1' = (lam + i*omega) z1 - (1 + i*c)|z1|^2 z1 + K (z2(t-tau2) - z1) + noise
+      z2' = (lam + i*omega) z2 - (1 + i*c)|z2|^2 z2 + K (z1(t-tau1) - z2) + noise
+    noise: independent complex OU-driven (real+imag) increments.
+    """
+    tau1 = float(max(0.0, tau1))
+    tau2 = float(max(0.0, tau2))
+
+    n_steps = int(np.round(T / dt))
+    burn_steps = int(np.round(burn / dt))
+
+    d1 = int(np.round(tau1 / dt))
+    d2 = int(np.round(tau2 / dt))
+    D = max(d1, d2, 1)
+
+    total = D + n_steps
+    z = np.zeros((2, total), dtype=np.complex128)
+
+    rng = np.random.default_rng(seed)
+    z[:, :D] = (rng.normal(size=(2, D)) + 1j * rng.normal(size=(2, D))) * 0.1
+
+    # OU noises for real/imag parts
+    eta1r = ou_input(total, dt, tau=0.05, sigma=noise_sigma, seed=seed + 101)
+    eta1i = ou_input(total, dt, tau=0.05, sigma=noise_sigma, seed=seed + 102)
+    eta2r = ou_input(total, dt, tau=0.05, sigma=noise_sigma, seed=seed + 201)
+    eta2i = ou_input(total, dt, tau=0.05, sigma=noise_sigma, seed=seed + 202)
+    sdt = np.sqrt(dt)
+
+    for i in range(D, total):
+        z1 = z[0, i - 1]
+        z2 = z[1, i - 1]
+        z2_del = z[1, i - d2]
+        z1_del = z[0, i - d1]
+
+        # intrinsic SL
+        f1 = (lam + 1j * omega) * z1 - (1.0 + 1j * c_shear) * (np.abs(z1) ** 2) * z1
+        f2 = (lam + 1j * omega) * z2 - (1.0 + 1j * c_shear) * (np.abs(z2) ** 2) * z2
+
+        # coupling (diffusive, delayed partner)
+        f1 += K * (z2_del - z1)
+        f2 += K * (z1_del - z2)
+
+        # noise increment
+        n1 = (eta1r[i] + 1j * eta1i[i]) * sdt
+        n2 = (eta2r[i] + 1j * eta2i[i]) * sdt
+
+        z[0, i] = z1 + dt * f1 + n1
+        z[1, i] = z2 + dt * f2 + n2
+
+    start = D + burn_steps
+    z1 = z[0, start:]
+    z2 = z[1, start:]
+    return z1, z2
+
+
+def metrics_sl(z1, z2, dt, omega_fallback):
+    """
+    Compute analogous metrics:
+      - phase difference (arg z1 - arg z2), Q (circular variance)
+      - amplitude difference statistics (|z1|-|z2|)
+      - Fisher information using Gaussian approx on [Re z1, Re z2] as a minimal proxy
+      - emergent T0 from common-mode of Re parts; fallback to 2π/omega if NaN
+    """
+    x1 = np.real(z1)
+    x2 = np.real(z2)
+    s = 0.5 * (x1 + x2)
+    d = 0.5 * (x1 - x2)
+
+    fs = 1.0 / dt
+    T0 = welch_peak_period_safe(s, fs=fs, fmin=0.8, fmax=20.0)
+    if not np.isfinite(T0):
+        T0 = float(2.0 * np.pi / omega_fallback)
+
+    # phase diff from complex phases
+    phi = wrap_pi(np.angle(z1) - np.angle(z2))
+    mean_phase = float(np.mean(phi))
+    Q = circular_variance(phi)
+
+    # amplitude carrier
+    a1 = np.abs(z1)
+    a2 = np.abs(z2)
+    amp_diff = a1 - a2
+    mean_abs_ampdiff = float(np.mean(np.abs(amp_diff)))
+    var_ampdiff = float(np.var(amp_diff))
+
+    # coordination proxy: MI(Re parts) × Q
+    I_INT = normalized_mutual_information(x1, x2, bins=24)
+    C = float(I_INT * Q)
+
+    # Gaussian state stats for Fisher (Re parts)
+    mu = np.array([np.mean(x1), np.mean(x2)], dtype=float)
+    Sigma = np.cov(np.vstack([x1, x2]))
+    out = {
+        "T0": float(T0),
+        "I_INT": float(I_INT),
+        "Q": float(Q),
+        "C": float(C),
+        "mean_phase": float(mean_phase),
+        "mean_abs_ampdiff": float(mean_abs_ampdiff),
+        "var_ampdiff": float(var_ampdiff),
+        "mu1": float(mu[0]),
+        "mu2": float(mu[1]),
+        "S11": float(Sigma[0, 0]),
+        "S12": float(Sigma[0, 1]),
+        "S22": float(Sigma[1, 1]),
+        "mu_s": float(np.mean(s)),
+        "var_s": float(np.var(s)),
+        "mu_d": float(np.mean(d)),
+        "var_d": float(np.var(d)),
+    }
+    return out
+
+
+def run_sl_shear_sweep():
+    delta_taus = np.linspace(0.0, DELTA_TAU_MAX, N_POINTS)
+    rows = []
+    for c_shear in SL_SHEAR_LIST:
+        for i, dtau in enumerate(delta_taus):
+            tau1 = TAU_AVG + 0.5 * dtau
+            tau2 = max(0.0, TAU_AVG - 0.5 * dtau)
+
+            per_rep = []
+            for r in range(SL_REPS):
+                seed = SEED0_SL + int(1000 * (c_shear + 10)) + i * 100 + r * 13
+                z1, z2 = simulate_stuart_landau_pair(
+                    tau1=tau1, tau2=tau2,
+                    dt=SL_DT, T=SL_T, burn=SL_BURN,
+                    lam=SL_LAM, omega=SL_OMEGA,
+                    c_shear=float(c_shear), K=SL_K,
+                    noise_sigma=NOISE_SIGMA_MAIN,  # match main noise scale by default
+                    seed=seed
+                )
+                m = metrics_sl(z1, z2, SL_DT, omega_fallback=SL_OMEGA)
+                m.update({"delta_tau": float(dtau), "tau1": float(tau1), "tau2": float(tau2), "shear_c": float(c_shear), "noise_sigma": float(NOISE_SIGMA_MAIN)})
+                per_rep.append(m)
+
+            df_rep = pd.DataFrame(per_rep)
+            mean = df_rep.mean(numeric_only=True)
+            std = df_rep.std(numeric_only=True, ddof=1)
+
+            row = {k: float(mean[k]) for k in mean.index}
+            for k in std.index:
+                row[f"{k}_std"] = float(std[k]) if np.isfinite(std[k]) else float("nan")
+
+            row["ratio"] = float(row["delta_tau"] / (row["T0"] + 1e-12))
+            rows.append(row)
+
+    df = pd.DataFrame(rows).sort_values(["shear_c", "delta_tau"]).reset_index(drop=True)
+
+    # Fisher full (2D Gaussian proxy) w.r.t delta_tau, per shear group
+    df["F_full"] = np.nan
+    for c_shear in sorted(df["shear_c"].unique()):
+        idx = df["shear_c"] == c_shear
+        g = df.loc[idx].copy().reset_index(drop=True)
+
+        mus = g[["mu1", "mu2"]].values
+        Sigmas = np.array([
+            [[g.loc[i, "S11"], g.loc[i, "S12"]],
+             [g.loc[i, "S12"], g.loc[i, "S22"]]]
+            for i in range(len(g))
+        ], dtype=float)
+
+        dmus = np.gradient(mus, g["delta_tau"].values, axis=0)
+        dSig = np.gradient(Sigmas, g["delta_tau"].values, axis=0)
+
+        F = [fisher_gaussian(mus[i], Sigmas[i], dmus[i], dSig[i]) for i in range(len(g))]
+        df.loc[idx, "F_full"] = F
+
+    return df
+
+
+def run_sl_noise_sweep():
+    delta_taus = np.linspace(0.0, DELTA_TAU_MAX, N_POINTS)
+    rows = []
+    # choose a representative shear (non-isochronic) for the noise mechanism panel
+    c_shear = 2.0
+
+    for sigma in SL_NOISE_LIST:
+        for i, dtau in enumerate(delta_taus):
+            tau1 = TAU_AVG + 0.5 * dtau
+            tau2 = max(0.0, TAU_AVG - 0.5 * dtau)
+
+            per_rep = []
+            for r in range(SL_REPS):
+                seed = SEED0_SL + int(1000 * (sigma * 100 + 1)) + i * 100 + r * 17
+                z1, z2 = simulate_stuart_landau_pair(
+                    tau1=tau1, tau2=tau2,
+                    dt=SL_DT, T=SL_T, burn=SL_BURN,
+                    lam=SL_LAM, omega=SL_OMEGA,
+                    c_shear=float(c_shear), K=SL_K,
+                    noise_sigma=float(sigma),
+                    seed=seed
+                )
+                m = metrics_sl(z1, z2, SL_DT, omega_fallback=SL_OMEGA)
+                m.update({"delta_tau": float(dtau), "tau1": float(tau1), "tau2": float(tau2), "shear_c": float(c_shear), "noise_sigma": float(sigma)})
+                per_rep.append(m)
+
+            df_rep = pd.DataFrame(per_rep)
+            mean = df_rep.mean(numeric_only=True)
+            std = df_rep.std(numeric_only=True, ddof=1)
+
+            row = {k: float(mean[k]) for k in mean.index}
+            for k in std.index:
+                row[f"{k}_std"] = float(std[k]) if np.isfinite(std[k]) else float("nan")
+
+            row["ratio"] = float(row["delta_tau"] / (row["T0"] + 1e-12))
+            rows.append(row)
+
+    df = pd.DataFrame(rows).sort_values(["noise_sigma", "delta_tau"]).reset_index(drop=True)
+
+    # Fisher full proxy per noise group
+    df["F_full"] = np.nan
+    for sigma in sorted(df["noise_sigma"].unique()):
+        idx = df["noise_sigma"] == sigma
+        g = df.loc[idx].copy().reset_index(drop=True)
+
+        mus = g[["mu1", "mu2"]].values
+        Sigmas = np.array([
+            [[g.loc[i, "S11"], g.loc[i, "S12"]],
+             [g.loc[i, "S12"], g.loc[i, "S22"]]]
+            for i in range(len(g))
+        ], dtype=float)
+
+        dmus = np.gradient(mus, g["delta_tau"].values, axis=0)
+        dSig = np.gradient(Sigmas, g["delta_tau"].values, axis=0)
+
+        F = [fisher_gaussian(mus[i], Sigmas[i], dmus[i], dSig[i]) for i in range(len(g))]
+        df.loc[idx, "F_full"] = F
+
+    return df
+
+
+def figure4_sl(df_shear, df_noise):
+    """
+    Figure 4 (mechanism via Stuart–Landau):
+      A) Shear effects: F_full and C curves across shear_c
+      B) Noise & amplitude carrier: relation between amp-diff and sensitivity proxy across noise
+    """
+    fig = plt.figure(figsize=(11, 7.5))
+
+    # Panel A: shear curves (plot F_full and C vs ratio)
+    ax1 = fig.add_subplot(2, 1, 1)
+    for c in sorted(df_shear["shear_c"].unique()):
+        g = df_shear[df_shear["shear_c"] == c]
+        ax1.plot(g["ratio"], g["F_full"], label=f"F_full (c={c})")
+    ax1.set_xlabel("Δτ / T0")
+    ax1.set_ylabel("Fisher information (proxy, Re-part Gaussian)")
+    ax1.set_title("Figure 4A. Shear dependence of sensitivity (Stuart–Landau)")
+    legend_outside(ax1, ncol=1)
+
+    # Panel B: noise / amplitude carrier
+    ax2 = fig.add_subplot(2, 1, 2)
+    for sigma in sorted(df_noise["noise_sigma"].unique()):
+        g = df_noise[df_noise["noise_sigma"] == sigma]
+        # show amplitude carrier vs sensitivity near small-asymmetry region:
+        ax2.plot(g["ratio"], g["mean_abs_ampdiff"], label=f"|Δamp| (σ={sigma})")
+    ax2.set_xlabel("Δτ / T0")
+    ax2.set_ylabel("Mean | |z1|-|z2| |")
+    ax2.set_title("Figure 4B. Noise-induced amplitude carrier (Stuart–Landau, c=2)")
+    legend_outside(ax2, ncol=1)
+
+    savefig(fig, os.path.join(OUTDIR, "Figure4.png"))
+
+
+# ============================================================
+# MAIN EXEC
+# ============================================================
+
+def main():
+    ensure_outdir()
+
+    # ---- MAIN (Figure 1 + CSV) ----
+    print("Running MAIN...")
+    T0_main = run_main()
+    print(f"[MAIN] Estimated T0 (main run) = {T0_main}")
+
+    # ---- A/B/C (CSV + Figure 2) ----
+    print("Running A/B/C (tanh model) sweep...")
+    df_abc = run_ABC(kappa=KAPPA_MAIN)
+    df_abc.to_csv(os.path.join(OUTDIR, "additional_analyses_ABCs_main.csv"), index=False)
+    figure2_separation(df_abc)
+
+    # ---- Kuramoto (CSV) ----
+    print("Running Kuramoto baseline...")
+    delta_taus = df_abc["delta_tau"].values
+    df_kur = run_kuramoto(delta_taus=delta_taus)
+    df_kur.to_csv(os.path.join(OUTDIR, "additional_analysis_D_kuramoto.csv"), index=False)
+
+    # ---- Kappa robustness (CSV) + Figure 3 ----
+    print("Running kappa robustness...")
+    df_kappa = run_kappa_robustness()
+    df_kappa.to_csv(os.path.join(OUTDIR, "additional_analysis_E_kappa_robustness.csv"), index=False)
+    figure3_kuramoto_kappa(df_kur, df_kappa)
+
+    # ---- Stuart–Landau (CSV) + Figure 4 ----
+    print("Running Stuart–Landau shear sweep...")
+    df_sl_shear = run_sl_shear_sweep()
+    df_sl_shear.to_csv(os.path.join(OUTDIR, "sl_shear_sweep.csv"), index=False)
+
+    print("Running Stuart–Landau noise sweep...")
+    df_sl_noise = run_sl_noise_sweep()
+    df_sl_noise.to_csv(os.path.join(OUTDIR, "sl_noise_sweep.csv"), index=False)
+
+    figure4_sl(df_sl_shear, df_sl_noise)
+
+    print("DONE. All outputs written to:", OUTDIR)
+
+
+if __name__ == "__main__":
+    main()
